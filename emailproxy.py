@@ -714,6 +714,24 @@ class OAuth2Helper:
     class TokenRefreshError(Exception):
         pass
 
+    # usernames currently authenticating via start_redirection_receiver_server
+    _redirection_active_lock = threading.Lock()
+    _redirection_active = set()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def reserve_redirection_slot(username):
+        """Yield True if we reserved the slot for username; False if a concurrent request already holds it."""
+        with OAuth2Helper._redirection_active_lock:
+            acquired = username not in OAuth2Helper._redirection_active
+            OAuth2Helper._redirection_active.add(username)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                with OAuth2Helper._redirection_active_lock:
+                    OAuth2Helper._redirection_active.discard(username)
+
     @staticmethod
     def get_oauth2_credentials(username, password, reload_remote_accounts=True):
         # noinspection GrazieInspection
@@ -1041,56 +1059,65 @@ class OAuth2Helper:
         redirect_listen_type = 'redirect_listen_address' if token_request['redirect_listen_address'] else 'redirect_uri'
         parsed_uri = urllib.parse.urlparse(token_request[redirect_listen_type])
         parsed_port = 80 if parsed_uri.port is None else parsed_uri.port
-        Log.debug('Local server auth mode (%s): starting server to listen for authentication response' %
-                  Log.format_host_port((parsed_uri.hostname, parsed_port)))
+        username = token_request['username']
 
-        class LoggingWSGIRequestHandler(wsgiref.simple_server.WSGIRequestHandler):
-            # pylint: disable-next=arguments-differ
-            def log_message(self, _format_string, *args):
-                Log.debug('Local server auth mode (%s): received authentication response' % Log.format_host_port(
-                    (parsed_uri.hostname, parsed_port)), *args)
-
-        class RedirectionReceiverWSGIApplication:
-            def __call__(self, environ, start_response):
-                start_response('200 OK', [('Content-type', 'text/html; charset=utf-8')])
-                token_request['response_url'] = '/'.join(token_request['redirect_uri'].split('/')[0:3]) + environ.get(
-                    'PATH_INFO') + '?' + environ.get('QUERY_STRING')
-                return [('<html><head><title>%s authentication complete (%s)</title><style type="text/css">body{margin:'
-                         '20px auto;line-height:1.3;font-family:sans-serif;font-size:16px;color:#444;padding:0 24px}'
-                         '</style></head><body><p>%s successfully authenticated account %s.</p><p>You can close this '
-                         'window.</p></body></html>' % ((APP_NAME, token_request['username']) * 2)).encode('utf-8')]
-
-        try:
-            wsgiref.simple_server.WSGIServer.allow_reuse_address = False
-            wsgiref.simple_server.WSGIServer.timeout = AUTHENTICATION_TIMEOUT
-            redirection_server = wsgiref.simple_server.make_server(str(parsed_uri.hostname), parsed_port,
-                                                                   RedirectionReceiverWSGIApplication(),
-                                                                   handler_class=LoggingWSGIRequestHandler)
-
-            Log.info('Please visit the following URL to authenticate account %s: %s' %
-                     (token_request['username'], token_request['permission_url']))
-            redirection_server.handle_request()
-            with contextlib.suppress(socket.error):
-                redirection_server.server_close()
-
-            if 'response_url' in token_request:
-                Log.debug('Local server auth mode (%s): closing local server and returning response' %
-                          Log.format_host_port((parsed_uri.hostname, parsed_port)), token_request['response_url'])
-            else:
-                # failed, likely because of an incorrect address (e.g., https vs http), but can also be due to timeout
+        with OAuth2Helper.reserve_redirection_slot(username) as acquired:
+            if not acquired:
+                # concurrent same-username AUTH would otherwise hit EADDRINUSE here
                 Log.info('Local server auth mode (%s):' % Log.format_host_port((parsed_uri.hostname, parsed_port)),
-                         'request failed - if this error reoccurs, please check `%s` for' % redirect_listen_type,
-                         token_request['username'], 'is not specified as `https` mistakenly. See the sample '
-                                                    'configuration file for documentation')
+                         'declining; retry after another in-flight authentication request completes for', username)
                 token_request['expired'] = True
+            else:
+                Log.debug('Local server auth mode (%s): starting server to listen for authentication response' %
+                          Log.format_host_port((parsed_uri.hostname, parsed_port)))
 
-        except socket.error as e:
-            Log.error('Local server auth mode (%s):' % Log.format_host_port((parsed_uri.hostname, parsed_port)),
-                      'unable to start local server. Please check that `%s` for %s is unique across accounts, '
-                      'specifies a port number, and is not already in use. See the documentation in the proxy\'s '
-                      'sample configuration file.' % (redirect_listen_type, token_request['username']),
-                      Log.error_string(e))
-            token_request['expired'] = True
+                class LoggingWSGIRequestHandler(wsgiref.simple_server.WSGIRequestHandler):
+                    # pylint: disable-next=arguments-differ
+                    def log_message(self, _format_string, *args):
+                        Log.debug('Local server auth mode (%s): received authentication response' % Log.format_host_port(
+                            (parsed_uri.hostname, parsed_port)), *args)
+
+                class RedirectionReceiverWSGIApplication:
+                    def __call__(self, environ, start_response):
+                        start_response('200 OK', [('Content-type', 'text/html; charset=utf-8')])
+                        token_request['response_url'] = '/'.join(token_request['redirect_uri'].split('/')[0:3]) + environ.get(
+                            'PATH_INFO') + '?' + environ.get('QUERY_STRING')
+                        return [('<html><head><title>%s authentication complete (%s)</title><style type="text/css">body{margin:'
+                                 '20px auto;line-height:1.3;font-family:sans-serif;font-size:16px;color:#444;padding:0 24px}'
+                                 '</style></head><body><p>%s successfully authenticated account %s.</p><p>You can close this '
+                                 'window.</p></body></html>' % ((APP_NAME, token_request['username']) * 2)).encode('utf-8')]
+
+                try:
+                    wsgiref.simple_server.WSGIServer.allow_reuse_address = False
+                    wsgiref.simple_server.WSGIServer.timeout = AUTHENTICATION_TIMEOUT
+                    redirection_server = wsgiref.simple_server.make_server(str(parsed_uri.hostname), parsed_port,
+                                                                           RedirectionReceiverWSGIApplication(),
+                                                                           handler_class=LoggingWSGIRequestHandler)
+
+                    Log.info('Please visit the following URL to authenticate account %s: %s' %
+                             (token_request['username'], token_request['permission_url']))
+                    redirection_server.handle_request()
+                    with contextlib.suppress(socket.error):
+                        redirection_server.server_close()
+
+                    if 'response_url' in token_request:
+                        Log.debug('Local server auth mode (%s): closing local server and returning response' %
+                                  Log.format_host_port((parsed_uri.hostname, parsed_port)), token_request['response_url'])
+                    else:
+                        # failed, likely because of an incorrect address (e.g., https vs http), but can also be due to timeout
+                        Log.info('Local server auth mode (%s):' % Log.format_host_port((parsed_uri.hostname, parsed_port)),
+                                 'request failed - if this error reoccurs, please check `%s` for' % redirect_listen_type,
+                                 token_request['username'], 'is not specified as `https` mistakenly. See the sample '
+                                                            'configuration file for documentation')
+                        token_request['expired'] = True
+
+                except socket.error as e:
+                    Log.error('Local server auth mode (%s):' % Log.format_host_port((parsed_uri.hostname, parsed_port)),
+                              'unable to start local server. Please check that `%s` for %s is unique across accounts, '
+                              'specifies a port number, and is not already in use. See the documentation in the proxy\'s '
+                              'sample configuration file.' % (redirect_listen_type, token_request['username']),
+                              Log.error_string(e))
+                    token_request['expired'] = True
 
         del token_request['local_server_auth']
         RESPONSE_QUEUE.put(token_request)
